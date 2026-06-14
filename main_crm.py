@@ -374,7 +374,7 @@ def get_customers_for_segment(segment_filter: str, db: Session):
     elif "60+ days" in segment_filter or "at_risk" in segment_filter or "no purchase" in segment_filter:
         cutoff = datetime.utcnow() - timedelta(days=60)
         return db.query(models.Customer).join(models.Order).group_by(models.Customer.id)\
-            .having(func.max(models.Order.created_at) < cutoff).all()
+            .having(func.max(models.Order.purchase_date) < cutoff).all()
     
     elif "one_time" in segment_filter or "order_count = 1" in segment_filter:
         return db.query(models.Customer).join(models.Order).group_by(models.Customer.id)\
