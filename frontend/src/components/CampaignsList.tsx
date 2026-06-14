@@ -37,6 +37,14 @@ export function CampaignsList({ campaigns, compact = false, showHeader = true }:
     );
   }
 
+  // Pre-calculate run numbers (for duplicate campaign names)
+  const nameCounts: Record<string, number> = {};
+  const runNumbers = safeCampaigns.slice().reverse().map((campaign) => {
+    const name = campaign?.name ?? 'Untitled Campaign';
+    nameCounts[name] = (nameCounts[name] || 0) + 1;
+    return { id: campaign.id, run: nameCounts[name] };
+  }).reverse(); // Reverse back to original order
+
   return (
     <div className="space-y-4">
       {showHeader && (
@@ -54,6 +62,9 @@ export function CampaignsList({ campaigns, compact = false, showHeader = true }:
           const rate = deliveryRate(delivered, sent);
           const campaignKey = campaign?.id ?? `campaign-${index}`;
 
+          const runData = runNumbers.find(r => r.id === campaign.id);
+          const hasMultipleRuns = runData && nameCounts[campaign?.name ?? ''] > 1;
+
           return (
             <div
               key={campaignKey}
@@ -61,11 +72,19 @@ export function CampaignsList({ campaigns, compact = false, showHeader = true }:
             >
               <div className="mb-4 flex items-start justify-between gap-4">
                 <div>
-                  <h3 className="text-base font-semibold text-gray-900">
-                    {campaign?.name ?? 'Untitled Campaign'}
-                  </h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-base font-semibold text-gray-900">
+                      {campaign?.name ?? 'Untitled Campaign'}
+                    </h3>
+                    {hasMultipleRuns && (
+                      <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-500">
+                        Run #{runData.run}
+                      </span>
+                    )}
+                  </div>
                   <p className="mt-0.5 text-sm text-gray-500">
-                    {campaign?.segment_name ?? 'No segment'}
+                    {campaign?.segment_name ?? 'No segment'} 
+                    {sent > 0 && <span className="ml-1 text-xs text-gray-400">({sent} customers targeted)</span>}
                   </p>
                 </div>
                 <div className="flex shrink-0 flex-col items-end gap-1.5">

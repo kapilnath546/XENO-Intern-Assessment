@@ -6,16 +6,35 @@ from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 import random as _random
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, func
 from database import engine, Base, get_db
 import models
 import ai_agent
 import segments
 import httpx
+import google.generativeai as genai
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
+import os
+from dotenv import load_dotenv
+from functools import lru_cache
+import message_bank
+
+load_dotenv()
+
+# Configure Gemini at module level
+# Strip quotes if present (in case they're included in .env)
+api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip('"').strip("'")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY or OPENAI_API_KEY not found in .env")
+genai.configure(api_key=api_key)
+
+# Simple cache for generated messages to respect free tier limits
+# Key: (segment_name, channel, tone) -> Value: message
+message_cache = {}
+CACHE_MAX_SIZE = 100
 
 from schemas import (
     CampaignResponse,
@@ -78,6 +97,12 @@ class WebhookPayload(BaseModel):
     """Callback payload from the channel simulator after delivery."""
     communication_id: int
     status: str
+
+
+class MessageGenerateRequest(BaseModel):
+    segment_description: str
+    channel: str = "WhatsApp"
+    tone: str = "friendly"
 
 
 # ---------------------------------------------------------------------------
@@ -330,29 +355,76 @@ def get_analytics_campaigns(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to fetch analytics: {exc}")
 
 
+def get_customers_for_segment(segment_filter: str, db: Session):
+    """
+    Returns customers matching a segment filter.
+    
+    We evaluate the filter here rather than in Python to keep
+    the query efficient. At 100k customers, Python-side filtering
+    would load the entire table into memory — unacceptable.
+    
+    Production version: a proper query builder or rule engine
+    (e.g. SpEL, JSON Logic) for arbitrary segment conditions.
+    For demo: we pattern-match on known filter strings.
+    """
+    if "total_spend > 20000" in segment_filter or "High Value" in segment_filter:
+        return db.query(models.Customer).join(models.Order).group_by(models.Customer.id)\
+            .having(func.sum(models.Order.amount) > 20000).all()
+    
+    elif "60+ days" in segment_filter or "at_risk" in segment_filter or "no purchase" in segment_filter:
+        cutoff = datetime.utcnow() - timedelta(days=60)
+        return db.query(models.Customer).join(models.Order).group_by(models.Customer.id)\
+            .having(func.max(models.Order.created_at) < cutoff).all()
+    
+    elif "one_time" in segment_filter or "order_count = 1" in segment_filter:
+        return db.query(models.Customer).join(models.Order).group_by(models.Customer.id)\
+            .having(func.count(models.Order.id) == 1).all()
+    
+    elif "frequent" in segment_filter or "order_count >= 4" in segment_filter:
+        return db.query(models.Customer).join(models.Order).group_by(models.Customer.id)\
+            .having(func.count(models.Order.id) >= 4).all()
+    
+    elif "Coffee" in segment_filter or "coffee" in segment_filter:
+        return db.query(models.Customer).join(models.Order)\
+            .filter(models.Order.category == "Coffee")\
+            .group_by(models.Customer.id).all()
+    
+    else:
+        # Fallback: all customers
+        # Log this so we know a new filter type needs to be added
+        print(f"[CRM] Unknown segment filter: '{segment_filter}' "
+              f"— falling back to all customers. Add this pattern.")
+        return db.query(models.Customer).all()
+
+
 @app.post("/api/campaigns/send")
 def send_campaign(
     recommendation: RecommendationRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Create a campaign and dispatch communications to matching customers.
-
-    Flow:
-      1. Resolve the delivery channel (from AI recommendation or random).
-      2. Create a Campaign record.
-      3. For each customer, create a Communication record (status=sent).
-      4. Queue an async task to POST each communication to the simulator.
-
-    We send to ALL customers for the demo since segment filtering is
-    done at the AI recommendation stage. Production would query only
-    customers matching the segment_filter criteria.
-
-    The simulator URL is hardcoded for the demo. Production would use
-    an environment variable (SIMULATOR_URL) injected via the deployment
-    config — different values for staging vs. production.
-    """
+    """Create a campaign and dispatch communications to matching customers."""
     try:
+        # Prevent duplicate launches of the same segment within 24 hours.
+        # localStorage handles the UI layer; this handles direct API calls.
+        # In production, this would be a distributed lock in Redis.
+        yesterday = datetime.utcnow() - timedelta(hours=24)
+        existing = db.query(models.Campaign).filter(
+            models.Campaign.target_segment == recommendation.target_criteria,
+            models.Campaign.created_at >= yesterday
+        ).first()
+        
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "duplicate_campaign",
+                    "message": f"A campaign for '{recommendation.segment_name}' was already "
+                               f"launched in the last 24 hours.",
+                    "launched_at": existing.created_at.isoformat(),
+                    "tip": "Wait 24 hours or change the segment to launch again."
+                }
+            )
         # Map the channel name from the AI recommendation to our enum.
         # If the channel is unrecognised, pick one randomly — this ensures
         # the demo always works even if the AI returns an unexpected value.
@@ -377,12 +449,15 @@ def send_campaign(
         db.commit()
         db.refresh(campaign)
 
-        customers = db.query(models.Customer).all()
+        matching_customers = get_customers_for_segment(
+            recommendation.target_criteria, db
+        )
 
         # Hardcoded for demo. In production: use SIMULATOR_URL env var.
         simulator_url = "http://localhost:8001/send"
 
-        for customer in customers:
+        communications = []
+        for customer in matching_customers:
             communication = models.Communication(
                 campaign_id=campaign.id,
                 customer_id=customer.id,
@@ -390,25 +465,34 @@ def send_campaign(
                 status=models.CommunicationStatus.sent,
             )
             db.add(communication)
-            db.commit()
-            db.refresh(communication)
+            communications.append(communication)
 
+        db.commit()
+        
+        for communication in communications:
+            db.refresh(communication)
             # Queue the actual HTTP dispatch as a background task so
             # this endpoint returns immediately (no blocking on network I/O).
             background_tasks.add_task(
                 send_to_simulator,
                 simulator_url,
                 communication.id,
-                customer.id,
+                communication.customer_id,
                 campaign.id,
                 recommendation.suggested_message,
             )
 
+        print(f"[CRM] Campaign '{campaign.name}' launched to "
+              f"{len(matching_customers)} customers "
+              f"(segment: {recommendation.target_criteria})")
+
         return {
             "campaign_id": campaign.id,
             "channel": chosen_channel.value,
-            "message": f"Campaign created and {len(customers)} communications queued for sending",
+            "message": f"Campaign created and {len(matching_customers)} communications queued for sending",
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to send campaign")
         raise HTTPException(status_code=500, detail=f"Failed to send campaign: {exc}")
@@ -477,6 +561,89 @@ def webhook_receipt(payload: WebhookPayload, db: Session = Depends(get_db)):
     db.commit()
 
     return {"message": "Status updated successfully"}
+
+
+@app.post("/api/segments/{segment_name}/generate-message")
+async def generate_segment_message(
+    segment_name: str,
+    request: MessageGenerateRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Generate a professional marketing message for a specific segment.
+    Uses pre-curated professional messages from message_bank.py
+    """
+    # Normalize segment name for lookup
+    segment_lookup = segment_name.lower().replace(" ", "_")
+
+    # Map common segment names to message bank keys
+    segment_map = {
+        "vip": "vip",
+        "repeat": "repeat_customers",
+        "repeat_customers": "repeat_customers",
+        "at_risk": "at_risk",
+        "atrisk": "at_risk",
+        "high_spenders": "high_spenders",
+        "high_value": "high_spenders",
+        "one_time_buyers": "new_customers",
+        "frequent_buyers": "vip",
+        "coffee_lovers": "coffee_lovers",
+        "new": "new_customers",
+        "new_customers": "new_customers",
+        "browsing": "browsing_visitors",
+        "browsing_visitors": "browsing_visitors"
+    }
+
+    segment_key = segment_map.get(segment_lookup, segment_lookup)
+    channel = request.channel.lower()
+    tone = request.tone.lower()
+
+    # Get the professional message from the bank
+    message = message_bank.get_message(segment_key, tone, channel)
+
+    print(f"[CRM] Serving professional message for {segment_name} "
+          f"(tone: {tone}, channel: {channel})")
+
+    return {
+        "message": message,
+        "segment": segment_name,
+        "channel": request.channel,
+        "tone": request.tone,
+        "generated_at": datetime.utcnow().isoformat(),
+        "source": "professional_bank"
+    }
+
+
+@app.get("/api/messages/all")
+async def get_all_messages():
+    """
+    Get all professional messages organized by segment, tone, and channel.
+    Perfect for the frontend to display all available campaign options.
+    """
+    return {
+        "messages": message_bank.list_all_messages(),
+        "segments": message_bank.get_segments(),
+        "tones": message_bank.get_tones(),
+        "channels": message_bank.get_channels()
+    }
+
+
+@app.get("/api/messages/segments")
+async def get_available_segments():
+    """Get list of all available customer segments."""
+    return {"segments": message_bank.get_segments()}
+
+
+@app.get("/api/messages/tones")
+async def get_available_tones():
+    """Get list of all available message tones."""
+    return {"tones": message_bank.get_tones()}
+
+
+@app.get("/api/messages/channels")
+async def get_available_channels():
+    """Get list of all available communication channels."""
+    return {"channels": message_bank.get_channels()}
 
 
 if __name__ == "__main__":

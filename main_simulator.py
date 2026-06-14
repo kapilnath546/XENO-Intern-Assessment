@@ -138,15 +138,15 @@ async def deliver_with_retry(
 
                 if response.status_code == 200:
                     print(
-                        f"[Simulator] ✓ Callback delivered "
+                        f"[Simulator] [OK] Callback delivered "
                         f"(comm_id={communication_id}, status={status}, attempt={attempt})"
                     )
                     return
                 else:
                     # Non-200 means the CRM accepted the request but rejected
-                    # the payload — log and retry in case it was a transient error.
+                    # the payload - log and retry in case it was a transient error.
                     print(
-                        f"[Simulator] ✗ HTTP {response.status_code} "
+                        f"[Simulator] [FAIL] HTTP {response.status_code} "
                         f"on attempt {attempt}/{max_attempts}"
                     )
 
@@ -154,7 +154,7 @@ async def deliver_with_retry(
             # Network-level failures (timeout, connection refused).
             # This is the most common failure mode when the CRM restarts.
             print(
-                f"[Simulator] ✗ Network error on attempt "
+                f"[Simulator] [FAIL] Network error on attempt "
                 f"{attempt}/{max_attempts}: {e}"
             )
 
@@ -163,10 +163,10 @@ async def deliver_with_retry(
             await asyncio.sleep(delay_seconds)
 
     # All attempts failed. In production: push to dead-letter queue.
-    # Here: log it. The CRM will show the message as stuck in "Sent" —
+    # Here: log it. The CRM will show the message as stuck in "Sent" -
     # visible to the operator so the failure isn't silently lost.
     print(
-        f"[Simulator] ✗ All {max_attempts} attempts failed for "
+        f"[Simulator] [FAIL] All {max_attempts} attempts failed for "
         f"comm_id={communication_id}. "
         f"Production: would push to DLQ for manual review."
     )

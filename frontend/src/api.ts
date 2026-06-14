@@ -257,7 +257,9 @@ export const api = {
         ...(channel ? { channel } : {}),
       }),
     });
-    if (!response.ok) throw new Error('Failed to launch segment campaign');
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: Failed to launch segment campaign`);
+    }
   },
 
   getCampaigns: async (): Promise<Campaign[]> => {

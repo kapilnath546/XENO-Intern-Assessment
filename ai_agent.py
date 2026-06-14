@@ -7,7 +7,6 @@ from sqlalchemy import func
 from datetime import datetime, timedelta
 from database import SessionLocal
 import models
-from openai import OpenAI
 from dotenv import load_dotenv
 import os
 import json
@@ -39,12 +38,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [AI Agent] %(message
 #   - Message tone personalisation per recipient (post-MVP)
 # =============================================================
 
-# We use GPT-4o-mini, not GPT-4o, for two reasons:
+# We use gemini-1.5-flash, not gemini-1.5-pro, for two reasons:
 # 1. The output is structured JSON — we don't need creative reasoning,
-#    just reliable schema adherence. Mini handles this perfectly.
+#    just reliable schema adherence. Flash handles this perfectly.
 # 2. At scale, AI recommendations would run as a scheduled job for
-#    thousands of brands. Cost compounds fast — mini is 15x cheaper.
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+#    thousands of brands. Cost compounds fast — flash is 10x cheaper.
+import google.generativeai as genai
+
+# Configure Gemini with the API key from the environment
+# We use the GEMINI_API_KEY, with OPENAI_API_KEY as fallback alias
+# Strip quotes if present (in case they're included in .env)
+api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip('"').strip("'")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY or OPENAI_API_KEY not found in .env")
+genai.configure(api_key=api_key)
 
 
 def get_customer_stats(db: Session) -> Dict:
@@ -164,57 +171,65 @@ def generate_campaign_recommendations() -> List[Dict]:
         # The prompt passes real aggregated stats (not raw rows) to the model.
         # This is important: we want the AI to reason about patterns, not
         # hallucinate — so we give it numbers it can actually use.
-        system_prompt = (
-            "You are a campaign strategist AI for a D2C brand in India. "
-            "You analyze customer data and recommend targeted marketing campaigns. "
-            "Always respond with valid JSON only. No explanation, no markdown."
-        )
-
         user_prompt = f"""
+You are a campaign strategist AI for an Indian D2C brand.
+Return ONLY valid JSON. No markdown, no backticks, no explanation.
+
 Analyze this customer data and recommend exactly 3 campaigns:
 
-CUSTOMER OVERVIEW:
+CUSTOMER DATA:
 - Total customers: {stats['total_customers']}
-- High Value (spend > ₹20,000): {stats['high_value_count']} customers, avg spend ₹{stats['high_value_avg_spend']:,.0f}
-- At Risk (no order in 60+ days): {stats['at_risk_count']} customers
+- High Value (spend > ₹20,000): {stats['high_value_count']} customers
+- At Risk (no order in 60+ days): {stats['at_risk_count']} customers  
 - One-Time Buyers: {stats['one_time_count']} customers
 - Frequent Buyers (4+ orders): {stats['frequent_count']} customers
 - Top categories: {', '.join(stats['top_categories']) if stats['top_categories'] else 'Coffee, Apparel, Beauty'}
 - Average order value: ₹{stats['overall_avg_order_value']:,.0f}
 
-Return this exact JSON structure:
+Return this exact JSON:
 {{
-  "data_insight": "One sharp observation about this customer base that a marketer should act on immediately",
+  "data_insight": "one sharp observation a marketer should act on",
   "campaigns": [
     {{
       "name": "campaign name",
       "segment": "human readable segment description",
       "segment_filter": "e.g. total_spend > 20000",
-      "estimated_audience": {stats['high_value_count']},
+      "estimated_audience": 4,
       "channel": "WhatsApp or SMS or Email or RCS",
-      "channel_reason": "one sentence: why this channel for this segment",
-      "message": "the actual message to send — personalized, conversational, brand-appropriate, written in a warm Indian D2C tone",
+      "channel_reason": "why this channel for this segment",
+      "message": "actual message to send, personal and conversational",
       "ai_reasoning": "why this segment, why this message, why now",
       "priority": "High or Medium or Low",
-      "expected_open_rate": "e.g. 40-50%"
+      "expected_open_rate": "e.g. 55-65%"
     }}
   ]
 }}
 """
 
-        logger.info("Calling OpenAI API for campaign recommendations...")
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
+        logger.info("Calling Gemini API for campaign recommendations...")
+        # We use gemini-2.5-flash for fast and reliable structured output
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        generation_config = genai.types.GenerationConfig(
             temperature=0.7,
-            response_format={"type": "json_object"},
+            max_output_tokens=4000,
+        )
+        
+        response = model.generate_content(
+            user_prompt,
+            generation_config=generation_config
         )
 
-        raw_content = response.choices[0].message.content
-        logger.info("OpenAI response received (%d chars)", len(raw_content or ""))
+        raw_content = response.text
+        logger.info("Gemini response received (%d chars)", len(raw_content or ""))
+
+        # Gemini sometimes wraps JSON in markdown code blocks even when told not to
+        # Strip them defensively before parsing
+        if raw_content.startswith("```"):
+            raw_content = raw_content.split("```")[1]
+            if raw_content.startswith("json"):
+                raw_content = raw_content[4:]
+        raw_content = raw_content.strip()
 
         # If the JSON parse fails, we raise immediately so the except clause
         # can log the raw content and return the fallback — never crash the API.
@@ -242,13 +257,14 @@ Return this exact JSON structure:
         return result
 
     except json.JSONDecodeError as exc:
-        # Log the raw response so we can inspect what GPT returned.
+        # Log the raw response so we can inspect what Gemini returned.
         # In production, this would alert the on-call team.
-        logger.error("AI response was not valid JSON: %s", exc)
-        logger.error("Raw response: %s", raw_content if 'raw_content' in dir() else "N/A")
+        logger.error("[AI Agent] Gemini returned invalid JSON: %s", exc)
+        logger.error("[AI Agent] Raw response: %s", raw_content if 'raw_content' in dir() else "N/A")
+        raise
 
     except Exception as exc:
-        logger.error("Error generating recommendations: %s — using fallback recommendations", exc)
+        logger.error("[AI Agent] Error generating recommendations: %s — using fallback recommendations", exc)
 
     finally:
         db.close()
@@ -264,30 +280,30 @@ Return this exact JSON structure:
             "segment_name":      "High Value Loyalty Reward",
             "segment":           "High Value Customers",
             "segment_filter":    "total_spend > 20000",
-            "target_criteria":   "Customers with total lifetime spend > ₹20,000",
+            "target_criteria":   "Customers with total lifetime spend > 20,000 INR",
             "estimated_audience": 5,
             "segment_size":      5,
             "channel":           "WhatsApp",
-            "channel_reason":    "WhatsApp has 90%+ open rates in India — ideal for VIP communication.",
+            "channel_reason":    "WhatsApp has 90%+ open rates in India - ideal for VIP communication.",
             "suggested_message": (
-                "Namaste! 🙏 You are one of our most valued customers, and we want to say thank you. "
+                "Namaste! You are one of our most valued customers, and we want to say thank you. "
                 "As a token of our appreciation, enjoy an exclusive 20% discount on your next order. "
-                "Your loyalty means everything to us. Shop now and use code VIP20. ✨"
+                "Your loyalty means everything to us. Shop now and use code VIP20."
             ),
             "message": (
-                "Namaste! 🙏 You are one of our most valued customers, and we want to say thank you. "
+                "Namaste! You are one of our most valued customers, and we want to say thank you. "
                 "As a token of our appreciation, enjoy an exclusive 20% discount on your next order. "
-                "Your loyalty means everything to us. Shop now and use code VIP20. ✨"
+                "Your loyalty means everything to us. Shop now and use code VIP20."
             ),
             "ai_reasoning": (
                 "High-value customers have proven purchasing power and brand trust. "
-                "Retention is 5x cheaper than acquisition — a well-timed loyalty reward "
+                "Retention is 5x cheaper than acquisition - a well-timed loyalty reward "
                 "increases lifetime value and reduces churn risk at the top of the funnel."
             ),
             "priority":            "High",
             "expected_open_rate":  "55-65%",
             "data_insight": (
-                "Your top 5 customers have spent an average of ₹22,000+ each — "
+                "Your top 5 customers have spent an average of 22,000+ INR each - "
                 "they are your most valuable retention target this quarter."
             ),
         },
@@ -300,15 +316,15 @@ Return this exact JSON structure:
             "estimated_audience": 5,
             "segment_size":      5,
             "channel":           "SMS",
-            "channel_reason":    "SMS reaches customers even without internet — critical for re-engagement.",
+            "channel_reason":    "SMS reaches customers even without internet - critical for re-engagement.",
             "suggested_message": (
-                "Hi! We miss you 💛 It's been a while since your last order. "
-                "Come back and get 15% off your next purchase — because you deserve it. "
+                "Hi! We miss you! It's been a while since your last order. "
+                "Come back and get 15% off your next purchase - because you deserve it. "
                 "Tap here to browse what's new: [link] Use code COMEBACK15. Offer valid 48 hrs."
             ),
             "message": (
-                "Hi! We miss you 💛 It's been a while since your last order. "
-                "Come back and get 15% off your next purchase — because you deserve it. "
+                "Hi! We miss you! It's been a while since your last order. "
+                "Come back and get 15% off your next purchase - because you deserve it. "
                 "Tap here to browse what's new: [link] Use code COMEBACK15. Offer valid 48 hrs."
             ),
             "ai_reasoning": (
@@ -319,7 +335,7 @@ Return this exact JSON structure:
             "priority":            "High",
             "expected_open_rate":  "30-40%",
             "data_insight": (
-                "25% of your customer base has been silent for 60+ days — "
+                "25% of your customer base has been silent for 60+ days - "
                 "your single biggest recoverable revenue opportunity right now."
             ),
         },
@@ -332,26 +348,26 @@ Return this exact JSON structure:
             "estimated_audience": 5,
             "segment_size":      5,
             "channel":           "Email",
-            "channel_reason":    "Email allows rich product showcasing — ideal for cross-sell discovery.",
+            "channel_reason":    "Email allows rich product showcasing - ideal for cross-sell discovery.",
             "suggested_message": (
-                "Hey there! 👋 Thank you for your first order with us — we hope you loved it! "
+                "Hey there! Thank you for your first order with us - we hope you loved it! "
                 "Customers who shop with us a second time tend to become long-term fans. "
-                "Explore what else we have for you and get ₹200 off your next order with code AGAIN200."
+                "Explore what else we have for you and get 200 INR off your next order with code AGAIN200."
             ),
             "message": (
-                "Hey there! 👋 Thank you for your first order with us — we hope you loved it! "
+                "Hey there! Thank you for your first order with us - we hope you loved it! "
                 "Customers who shop with us a second time tend to become long-term fans. "
-                "Explore what else we have for you and get ₹200 off your next order with code AGAIN200."
+                "Explore what else we have for you and get 200 INR off your next order with code AGAIN200."
             ),
             "ai_reasoning": (
-                "One-time buyers have already trusted the brand with a purchase — the hard part is done. "
+                "One-time buyers have already trusted the brand with a purchase - the hard part is done. "
                 "Industry data shows 20-30% of first-time buyers convert on a targeted second-purchase nudge. "
                 "Email works here because product discovery requires more visual space than SMS/WhatsApp."
             ),
             "priority":            "Medium",
             "expected_open_rate":  "25-35%",
             "data_insight": (
-                "One-time buyers make up a quarter of your customer base — "
+                "One-time buyers make up a quarter of your customer base - "
                 "converting just 30% of them doubles your repeat-purchase cohort."
             ),
         },

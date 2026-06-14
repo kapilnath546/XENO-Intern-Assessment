@@ -90,7 +90,10 @@ export function DashboardPage() {
 
       <div className="grid gap-8 xl:grid-cols-2">
         <section>
-          <RecommendationsPanel onLaunch={handleLaunchCampaign} />
+          <RecommendationsPanel 
+            onLaunch={handleLaunchCampaign} 
+            launchedSegmentNames={campaigns.map(c => c.name)} 
+          />
         </section>
 
         <section>

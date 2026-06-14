@@ -43,14 +43,34 @@ export function AnalyticsPage() {
 
   const safeCampaigns = Array.isArray(campaigns) ? campaigns : [];
 
-  const chartData = safeCampaigns.map((c) => ({
-    name: c.name.length > 18 ? `${c.name.slice(0, 16)}…` : c.name,
-    Sent: c.sent,
-    Delivered: c.delivered,
-    Read: c.read,
-    Clicked: c.clicked,
-    Failed: c.failed,
-  }));
+  // Pre-calculate run numbers (for duplicate campaign names)
+  const nameCounts: Record<string, number> = {};
+  const runNumbers = safeCampaigns.slice().reverse().map((campaign) => {
+    const name = campaign?.name ?? 'Untitled Campaign';
+    nameCounts[name] = (nameCounts[name] || 0) + 1;
+    return { id: campaign.id, run: nameCounts[name] };
+  }).reverse(); // Reverse back to original order
+
+  const getCampaignDisplayName = (c: AnalyticsCampaign) => {
+    const runData = runNumbers.find(r => r.id === c.id);
+    const hasMultipleRuns = runData && nameCounts[c.name] > 1;
+    if (hasMultipleRuns) {
+      return `${c.name} (Run #${runData.run})`;
+    }
+    return c.name;
+  };
+
+  const chartData = safeCampaigns.map((c) => {
+    const displayName = getCampaignDisplayName(c);
+    return {
+      name: displayName.length > 22 ? `${displayName.slice(0, 20)}…` : displayName,
+      Sent: c.sent,
+      Delivered: c.delivered,
+      Read: c.read,
+      Clicked: c.clicked,
+      Failed: c.failed,
+    };
+  });
 
   return (
     <div className="space-y-8">
@@ -114,9 +134,11 @@ export function AnalyticsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {safeCampaigns.map((campaign) => (
+                  {safeCampaigns.map((campaign) => {
+                    const displayName = getCampaignDisplayName(campaign);
+                    return (
                     <tr key={campaign.id} className="border-b border-gray-100 last:border-0">
-                      <td className="px-6 py-4 font-medium text-gray-900">{campaign.name}</td>
+                      <td className="px-6 py-4 font-medium text-gray-900">{displayName}</td>
                       <td className="px-6 py-4 text-gray-600">{campaign.segment_name}</td>
                       <td className="px-6 py-4 text-gray-600">{formatLaunchedAt(campaign.launched_at)}</td>
                       <td className="px-6 py-4 text-right text-gray-900">{campaign.sent}</td>
@@ -128,7 +150,8 @@ export function AnalyticsPage() {
                         {campaign.delivery_rate}%
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
