@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Database — never commit the DB file
+*.db
+*.sqlite
+*.sqlite3
+crm.db
+
+# Environment — NEVER commit API keys
+.env
+.env.local
+.env.*
+*.env
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*~
+
+# Logs
+*.log
+logs/
