@@ -284,31 +284,7 @@ customers_data = [
 
 
 
-# ---------------------------------------------------------------------------
-# Generate 4,980 background customers to make the UI look like a real production CRM
-# ---------------------------------------------------------------------------
-cities = ["Mumbai", "Delhi", "Bangalore", "Hyderabad", "Pune", "Chennai", "Kolkata", "Ahmedabad", "Jaipur"]
-categories = ["Apparel", "Coffee", "Beauty", "Jewellery", "Electronics", "Home"]
 
-for i in range(4980):
-    # Mostly 0 or 1 orders to simulate a typical e-commerce funnel, with some frequent buyers
-    order_count = random.choices([0, 1, 2, 5], weights=[0.4, 0.4, 0.15, 0.05])[0]
-    orders = []
-    for _ in range(order_count):
-        orders.append({
-            "product": "Assorted Item",
-            "category": random.choice(categories),
-            "amount": round(random.uniform(300, 4500), 2),
-            "date": today - timedelta(days=random.randint(1, 300))
-        })
-        
-    customers_data.append({
-        "name": f"Shopper {i+100}",
-        "email": f"shopper{i+100}@example.com",
-        "phone": f"+91-{random.randint(9000000000, 9999999999)}",
-        "city": random.choice(cities),
-        "orders": orders
-    })
 
 def seed():
     """Drop existing data and repopulate with fresh demo customers."""
