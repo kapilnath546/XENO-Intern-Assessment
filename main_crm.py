@@ -453,8 +453,9 @@ def send_campaign(
             recommendation.target_criteria, db
         )
 
-        # Hardcoded for demo. In production: use SIMULATOR_URL env var.
-        simulator_url = "http://localhost:8001/send"
+        # Read from env so the deployed URL can be set without code changes.
+        # Local dev fallback: http://localhost:8001/send
+        simulator_url = os.getenv("SIMULATOR_URL", "http://localhost:8001/send")
 
         communications = []
         for customer in matching_customers:
@@ -512,14 +513,14 @@ async def send_to_simulator(
     and the channel provider's infrastructure handles reliability.
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
+        # Read CRM_BASE_URL from env for production; fallback to localhost for dev.
+        crm_base = os.getenv("CRM_BASE_URL", "http://localhost:8000")
         payload = {
             "communication_id": communication_id,
             "customer_id":      customer_id,
             "campaign_id":      campaign_id,
             "message":          message,
-            # Webhook URL where the simulator should call back with status updates.
-            # Hardcoded for demo — production: CRM_BASE_URL env var.
-            "webhook_url": "http://localhost:8000/api/webhook/receipt",
+            "webhook_url":      f"{crm_base}/api/webhook/receipt",
         }
         try:
             response = await client.post(simulator_url, json=payload)
