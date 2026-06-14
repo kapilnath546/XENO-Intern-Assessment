@@ -283,10 +283,6 @@ customers_data = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Seeding logic
-#    # (Same exactly 20 hardcoded customers to ensure edge cases work)
-]
 
 # ---------------------------------------------------------------------------
 # Generate 4,980 background customers to make the UI look like a real production CRM
