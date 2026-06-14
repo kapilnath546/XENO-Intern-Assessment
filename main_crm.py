@@ -7,7 +7,7 @@ import random as _random
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text, func
-from database import engine, Base, get_db
+from database import engine, Base, get_db, SessionLocal
 import models
 import ai_agent
 import segments
@@ -476,16 +476,16 @@ def send_campaign(
         
         for communication in communications:
             db.refresh(communication)
-            # Queue the actual HTTP dispatch as a background task so
-            # this endpoint returns immediately (no blocking on network I/O).
-            background_tasks.add_task(
-                send_to_simulator,
-                simulator_url,
-                communication.id,
-                communication.customer_id,
-                campaign.id,
-                recommendation.suggested_message,
+            # Queue the actual delivery simulation directly as a background task.
+            # No HTTP network hop needed since the simulator is built-in.
+            payload = SimulatorPayload(
+                communication_id=communication.id,
+                customer_id=communication.customer_id,
+                campaign_id=campaign.id,
+                message=recommendation.suggested_message,
+                webhook_url=f"{crm_base}/api/webhook/receipt"
             )
+            background_tasks.add_task(simulator_process_delivery, payload)
 
         print(f"[CRM] Campaign '{campaign.name}' launched to "
               f"{len(matching_customers)} customers "
@@ -503,34 +503,7 @@ def send_campaign(
         raise HTTPException(status_code=500, detail=f"Failed to send campaign: {exc}")
 
 
-async def send_to_simulator(
-    simulator_url: str,
-    communication_id: int,
-    customer_id: int,
-    campaign_id: int,
-    message: str
-):
-    """POST a single communication payload to the channel simulator.
 
-    This is intentionally simple — the retry logic lives in the simulator,
-    not here. This mirrors the real architecture: the CRM fires and forgets,
-    and the channel provider's infrastructure handles reliability.
-    """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # Read CRM_BASE_URL from env for production; fallback to localhost for dev.
-        crm_base = os.getenv("CRM_BASE_URL", "http://localhost:8000")
-        payload = {
-            "communication_id": communication_id,
-            "customer_id":      customer_id,
-            "campaign_id":      campaign_id,
-            "message":          message,
-            "webhook_url":      f"{crm_base}/api/webhook/receipt",
-        }
-        try:
-            response = await client.post(simulator_url, json=payload)
-            logger.info("Sent comm %d to simulator: HTTP %d", communication_id, response.status_code)
-        except Exception as e:
-            logger.error("Error sending comm %d to simulator: %s", communication_id, e)
 
 
 # ===========================================================================
@@ -565,25 +538,22 @@ async def simulator_process_delivery(payload: SimulatorPayload):
     weights  = [0.40, 0.30, 0.20, 0.10]
     status   = random.choices(outcomes, weights=weights, k=1)[0]
 
-    # 3. Fire the webhook back to the CRM
-    callback_data = {
-        "communication_id": payload.communication_id,
-        "status": status,
-    }
+    # 3. Fire the webhook back to the CRM directly using local function call.
+    # We bypass HTTP so that this works perfectly on any host, without
+    # needing the CRM_BASE_URL to match exactly.
     
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
+    webhook_payload = WebhookPayload(
+        communication_id=payload.communication_id,
+        status=status,
+    )
+    
+    with SessionLocal() as db:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                res = await client.post(payload.webhook_url, json=callback_data)
-                if res.status_code == 200:
-                    logger.info("[Simulator] Webhook delivered for comm %d (status: %s)", payload.communication_id, status)
-                    return
+            # We call the exact same FastAPI endpoint function, just internally.
+            webhook_receipt(webhook_payload, db=db)
+            logger.info("[Simulator] Webhook delivered internally for comm %d (status: %s)", payload.communication_id, status)
         except Exception as e:
-            logger.warning("[Simulator] Webhook attempt %d failed: %s", attempt, e)
-            
-        if attempt < max_attempts:
-            await asyncio.sleep(2)
+            logger.warning("[Simulator] Internal webhook failed: %s", e)
 
 
 # ===========================================================================
