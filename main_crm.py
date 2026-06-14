@@ -570,47 +570,110 @@ async def generate_segment_message(
     db: Session = Depends(get_db)
 ):
     """
-    Generate a professional marketing message for a specific segment.
-    Uses pre-curated professional messages from message_bank.py
+    Generate a fresh AI marketing message via Gemini for a given segment and tone.
+    Falls back to the professional message bank if Gemini is unavailable.
     """
-    # Normalize segment name for lookup
-    segment_lookup = segment_name.lower().replace(" ", "_")
+    tone = request.tone.lower()
+    channel = request.channel.lower()
 
-    # Map common segment names to message bank keys
-    segment_map = {
-        "vip": "vip",
-        "repeat": "repeat_customers",
-        "repeat_customers": "repeat_customers",
-        "at_risk": "at_risk",
-        "atrisk": "at_risk",
-        "high_spenders": "high_spenders",
-        "high_value": "high_spenders",
-        "one_time_buyers": "new_customers",
-        "frequent_buyers": "vip",
-        "coffee_lovers": "coffee_lovers",
-        "new": "new_customers",
-        "new_customers": "new_customers",
-        "browsing": "browsing_visitors",
-        "browsing_visitors": "browsing_visitors"
+    # Human-readable segment labels for the AI prompt
+    segment_labels: dict[str, str] = {
+        "high_value":      "High Value customers (lifetime spend > ₹20,000, premium buyers)",
+        "at_risk":         "At-Risk customers (no purchase in 60+ days, churn risk)",
+        "one_time_buyers": "One-Time Buyers (made exactly one purchase, need a nudge to return)",
+        "frequent_buyers": "Frequent Buyers (4+ orders, highly loyal, treat as VIPs)",
+        "coffee_lovers":   "Coffee Lovers (strong category affinity, habitual buyers)",
     }
 
-    segment_key = segment_map.get(segment_lookup, segment_lookup)
-    channel = request.channel.lower()
-    tone = request.tone.lower()
+    segment_label = segment_labels.get(
+        segment_name.lower(),
+        segment_name.replace("_", " ").title() + " customers"
+    )
 
-    # Get the professional message from the bank
-    message = message_bank.get_message(segment_key, tone, channel)
+    tone_descriptions: dict[str, str] = {
+        "friendly":  "warm, conversational, and approachable",
+        "urgent":    "time-sensitive with urgency, FOMO-driven",
+        "exclusive": "premium, members-only, elevated",
+        "grateful":  "sincere, appreciative, heartfelt",
+    }
+    tone_desc = tone_descriptions.get(tone, tone)
 
-    print(f"[CRM] Serving professional message for {segment_name} "
-          f"(tone: {tone}, channel: {channel})")
+    channel_ctx: dict[str, str] = {
+        "whatsapp": "WhatsApp message (short, personal, uses emojis naturally)",
+        "sms":      "SMS text (very concise, under 160 chars)",
+        "email":    "marketing email body (slightly longer, professional)",
+    }
+    channel_hint = channel_ctx.get(channel, channel)
+
+    prompt = (
+        f"You are an expert D2C marketing copywriter for an Indian brand.\n"
+        f"Write ONE short, punchy campaign message for: {segment_label}.\n"
+        f"Tone: {tone_desc}.\n"
+        f"Format: {channel_hint}.\n"
+        f"Rules:\n"
+        f"- 2-3 sentences maximum\n"
+        f"- Natural, human, no corporate jargon\n"
+        f"- Include one specific benefit or offer (discount, access, reward)\n"
+        f"- Use Indian cultural context (₹ for currency, relatable references)\n"
+        f"- End with a clear call-to-action\n"
+        f"- Do NOT use placeholders like [Name] or [link]\n"
+        f"- Return ONLY the message text. No quotes. No explanation."
+    )
+
+    generated_message: str = ""
+
+    # Model priority: lite models have separate quotas and lowest latency.
+    # Confirmed working on free tier for this key via direct API test.
+    models_to_try = [
+        "gemini-flash-lite-latest",
+        "gemini-flash-latest",
+        "gemini-pro-latest",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ]
+
+    for model_name in models_to_try:
+        try:
+            logger.info("[CRM] Calling %s for segment='%s' tone='%s'", model_name, segment_name, tone)
+            ai_model = genai.GenerativeModel(model_name)
+            response = ai_model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.95,
+                    max_output_tokens=200,
+                ),
+            )
+            raw = (response.text or "").strip()
+            raw = raw.strip('"').strip("'").strip("`").strip()
+            if raw:
+                generated_message = raw
+                logger.info("[CRM] %s generated message (%d chars)", model_name, len(raw))
+                break
+        except Exception as exc:
+            logger.warning("[CRM] %s failed (%s) — trying next model", model_name, exc)
+
+    # Fall back to message bank if Gemini gave nothing
+    if not generated_message:
+        segment_map = {
+            "high_value":      "high_spenders",
+            "at_risk":         "at_risk",
+            "one_time_buyers": "new_customers",
+            "frequent_buyers": "vip",
+            "coffee_lovers":   "coffee_lovers",
+        }
+        bank_key = segment_map.get(segment_name.lower(), "vip")
+        generated_message = message_bank.get_message(bank_key, tone, channel)
+        source = "message_bank"
+    else:
+        source = "gemini"
 
     return {
-        "message": message,
+        "message": generated_message,
         "segment": segment_name,
         "channel": request.channel,
         "tone": request.tone,
         "generated_at": datetime.utcnow().isoformat(),
-        "source": "professional_bank"
+        "source": source,
     }
 
 
