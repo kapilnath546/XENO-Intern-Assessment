@@ -2,7 +2,7 @@
 ai_agent.py — AI Campaign Recommendation Engine
 """
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 from datetime import datetime, timedelta
 from database import SessionLocal
@@ -72,7 +72,7 @@ def get_customer_stats(db: Session) -> Dict:
     # doesn't support window functions as elegantly as PostgreSQL would.
     # At production scale (PostgreSQL), this would be a single GROUP BY query.
     all_customers = (
-        db.query(models.Customer).all()
+        db.query(models.Customer).options(joinedload(models.Customer.orders)).all()
     )
 
     at_risk_cutoff = datetime.utcnow() - timedelta(days=60)
