@@ -372,12 +372,12 @@ def seed():
         orders = cust["orders"]
         total_spend = sum(o["amount"] for o in orders)
         order_count = len(orders)
-        last_date = max(o["date"] for o in orders)
+        last_date = max([o["date"] for o in orders], default=None)
         categories = {o["category"] for o in orders}
 
         if total_spend > 20000:
             high_value += 1
-        if order_count > 0 and last_date < at_risk_cutoff:
+        if order_count > 0 and last_date and last_date < at_risk_cutoff:
             at_risk += 1
         if order_count == 1:
             one_time += 1
