@@ -453,9 +453,13 @@ def send_campaign(
             recommendation.target_criteria, db
         )
 
-        # Read from env so the deployed URL can be set without code changes.
-        # Local dev fallback: http://localhost:8001/send
-        simulator_url = os.getenv("SIMULATOR_URL", "http://localhost:8001/send")
+        # 4. Create communication records (one per customer)
+        # ---------------------------------------------------------
+        # Read CRM_BASE_URL from env for production; fallback to localhost for dev.
+        crm_base = os.getenv("CRM_BASE_URL", "http://localhost:8000")
+        
+        # Point the simulator URL to our internally hosted simulator endpoint
+        simulator_url = os.getenv("SIMULATOR_URL", f"{crm_base}/simulator/send")
 
         communications = []
         for customer in matching_customers:
@@ -528,6 +532,63 @@ async def send_to_simulator(
         except Exception as e:
             logger.error("Error sending comm %d to simulator: %s", communication_id, e)
 
+
+# ===========================================================================
+# BUILT-IN CHANNEL SIMULATOR (Merged for easy hosting)
+# ===========================================================================
+# In a real architecture, this would be a separate third-party service 
+# (e.g. Twilio). We embed it here so the demo can run on a single cloud server.
+
+import asyncio
+import random
+
+class SimulatorPayload(BaseModel):
+    communication_id: int
+    customer_id: int
+    campaign_id: int
+    message: str
+    webhook_url: str
+
+@app.post("/simulator/send")
+def simulator_receive_dispatch(payload: SimulatorPayload, background_tasks: BackgroundTasks):
+    """Simulator receives the dispatch and queues the delivery simulation."""
+    background_tasks.add_task(simulator_process_delivery, payload)
+    return {"status": "accepted"}
+
+async def simulator_process_delivery(payload: SimulatorPayload):
+    """Simulate latency and varying delivery outcomes, then fire the webhook."""
+    # 1. Simulate network transit latency (2 to 5 seconds)
+    await asyncio.sleep(random.uniform(2, 5))
+
+    # 2. Simulate real-world delivery funnel metrics
+    outcomes = ["delivered", "read", "clicked", "failed"]
+    weights  = [0.40, 0.30, 0.20, 0.10]
+    status   = random.choices(outcomes, weights=weights, k=1)[0]
+
+    # 3. Fire the webhook back to the CRM
+    callback_data = {
+        "communication_id": payload.communication_id,
+        "status": status,
+    }
+    
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.post(payload.webhook_url, json=callback_data)
+                if res.status_code == 200:
+                    logger.info("[Simulator] Webhook delivered for comm %d (status: %s)", payload.communication_id, status)
+                    return
+        except Exception as e:
+            logger.warning("[Simulator] Webhook attempt %d failed: %s", attempt, e)
+            
+        if attempt < max_attempts:
+            await asyncio.sleep(2)
+
+
+# ===========================================================================
+# WEBHOOK HANDLERS
+# ===========================================================================
 
 @app.post("/api/webhook/receipt")
 def webhook_receipt(payload: WebhookPayload, db: Session = Depends(get_db)):
